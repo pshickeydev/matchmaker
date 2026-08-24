@@ -1,0 +1,81 @@
+---
+title: Matchmaker — Crush Fleet Orchestration (SPEC)
+---
+flowchart TB
+    subgraph INTAKE["Intake"]
+        USER(["Operator / CLI<br/>submit goal (step DAG)"])
+        FUTURE(["Future: cron, webhooks,<br/>issue labels — §8"])
+    end
+
+    subgraph MM["Matchmaker — single Go binary (§10)"]
+        subgraph CORE["Core loops"]
+            RECON["Reconcile loop (~30s tick)<br/>observe · compare · converge<br/>health · version/build_id · SSE status<br/>start/adopt/quarantine instances"]
+            DISP["Dispatch<br/>resolve targets (names/tags/all)<br/>gate on needs · per-instance serialization"]
+            SUP["Supervision<br/>permission policy: deny / grant_all / ask<br/>timeouts → cancel · retries (same instance)"]
+            AGG["Aggregation<br/>per-goal report: DAG + runs + notes"]
+        end
+
+        STORE[("SQLite store (§9.2)<br/>goals · steps · runs · notes · instance state<br/>persisted before dispatch")]
+        NOTES["Notes MCP server (§5.4)<br/>HTTP, loopback<br/>note_send(goal,to,body) · note_read(goal,since)"]
+        TUI["TUI dashboard (bubbletea)<br/>live runs · notes · ask approvals"]
+    end
+
+    CONFIG["Fleet config (static)<br/>name · path · port · tags · crush_flags<br/>collision-validated at load"]
+
+    subgraph FLEET["Fleet — one crush server per project (127.0.0.1 only)"]
+        direction TB
+        S1["crush server :41001<br/>/repo/a"]
+        S2["crush server :41002<br/>/repo/b"]
+        S3["crush server :41003<br/>/repo/c"]
+        SN["crush server :41xxx<br/>/repo/…"]
+        W1["workspace + session<br/>(agent runs here)"]
+        W2["workspace + session"]
+        W3["workspace + session"]
+        WN["workspace + session"]
+        S1 --- W1
+        S2 --- W2
+        S3 --- W3
+        SN --- WN
+    end
+
+    USER -->|"goal: steps, needs,<br/>supervision, timeouts"| DISP
+    FUTURE -.-> DISP
+    CONFIG -->|"desired state"| RECON
+    DISP <-->|"read/write state"| STORE
+    SUP <-->|"state transitions"| STORE
+    AGG <-->|"source of truth"| STORE
+    RECON <-->|"instance state"| STORE
+
+    RECON -->|"spawn os/exec<br/>crush server -H tcp://… --cwd …"| S1
+    RECON --> S2
+    RECON --> S3
+    RECON --> SN
+
+    DISP -->|"POST /v1/workspaces (client_id=UUID, path)<br/>POST agent: templated prompt<br/>+ injected pending notes"| W1
+    DISP --> W2
+    DISP --> W3
+    DISP --> WN
+
+    W1 ==>|"SSE events: message, permission_request, run_complete(RunID)"| SUP
+    W2 ==> SUP
+    W3 ==> SUP
+    WN ==> SUP
+
+    SUP -->|"grant / cancel"| W1
+
+    W1 <-->|"MCP tool calls<br/>note_send / note_read"| NOTES
+    W2 <-->|"note_send / note_read"| NOTES
+    W3 <-->|"note_send / note_read"| NOTES
+    WN <-->|"note_send / note_read"| NOTES
+    NOTES <-->|"persist notes"| STORE
+
+    SUP -->|"events + results"| AGG
+    AGG -->|"per-goal report"| TUI
+    SUP -.->|"ask policy escalation"| TUI
+    TUI -.->|"operator decision"| SUP
+
+    classDef future stroke-dasharray: 5 5,opacity:.7
+    class FUTURE future
+    classDef store fill:#fdf0d5,stroke:#8a6d00
+    class STORE store
+    classDef secret fill:#ffe5e5,stroke:#a00
