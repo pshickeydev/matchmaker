@@ -1,0 +1,17 @@
+# Binaries
+matchmaker
+*.exe
+
+# Go
+/vendor/
+
+# Orchestrator runtime data
+*.db
+*.db-journal
+*.db-wal
+
+# Crush local data
+.crush/
+
+# OS / editor
+.DS_Store

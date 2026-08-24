@@ -243,6 +243,11 @@ in its own goal.
   in each project's Crush config. Tools: `note_send(goal, to, body)` and
   `note_read(goal, since)`. `to` is an instance name, a tag, or `all`;
   `goal` multiplexes across goals (§9.4).
+- **Registration**: the reconcile loop ensures each managed project's
+  `.crushrc` registers the notes MCP server, merging into existing config
+  non-destructively (add the `mcp` entry; never remove or rewrite unrelated
+  settings). Projects that opt out lose live note tools but still receive
+  injected notes at dispatch (§5.6).
 - **Delivery semantics**: notes are at-least-once and unordered across
   senders. Unread notes addressed to an instance are delivered (a) at the
   start of its next run, injected into the prompt as an untrusted "notes from
@@ -281,6 +286,11 @@ in its own goal.
   instances without note access still receive injected notes (§5.4).
 - **No code merging.** The orchestrator reports results; it does not reconcile
   conflicting edits across projects.
+- **No implicit repo mutation beyond Crush's own.** Crush server workspace
+  creation materializes a `.crush/` data dir inside each managed project
+  (verified v0.91.0, §9.6). The orchestrator adds the notes MCP registration
+  (§5.4); both should be documented for users, and neither may overwrite
+  existing project config.
 
 ## 6. Security Model
 
@@ -313,6 +323,8 @@ in its own goal.
 | Version drift (C4) | reconcile: version check | restart idle instance; queue if busy |
 | Orchestrator restart | — | reload store; first reconcile tick adopts live servers and workspaces; in-flight goals resume from persisted step state |
 | Note MCP unreachable from an instance | tool call failure in run | degrade: step runs without note tools; injected pending notes still apply |
+| Note tool calls arrive without goal context (server restarted mid-goal) | MCP request for unknown/completed goal | reject with explicit error; note persists if goal still active, else dropped and logged |
+| Store (SQLite) locked/corrupt | write failure on transition | crash the orchestrator loudly; on restart, integrity-check before reconcile resumes |
 
 ## 8. Future Work
 
@@ -325,6 +337,8 @@ in its own goal.
 - **Remote fleets**: orchestrator-fronted auth (C2) for servers on other hosts.
 - **Orchestrator API**: expose goal submission and reports over HTTP so other
   tools can drive the fleet.
+- **Run metrics**: token usage and cost per run/goal are not currently
+  collected; if the pinned Crush API exposes them, add to aggregation (§5.5).
 - **Shared-server topology**: the target abstraction (§3.1) already permits it.
 
 ## 9. Decisions
