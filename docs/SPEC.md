@@ -38,11 +38,15 @@ Crush ships a first-class client/server mode:
 
 ### 2.1 Relevant constraints of the Crush server
 
-- **C1 — Client-oriented lifecycle.** A workspace is torn down ~10s after its
-  last SSE stream detaches (plus a ~30s creation grace period). The server
-  idle-shuts-down (~60s) when no workspaces remain.
-- **C2 — No authentication.** The API is single-user and local. TCP exposure
-  requires external access control (bind to loopback, or front with a proxy).
+- **C1 — Client-claim lifecycle.** A workspace's lifetime is tied to the
+  claiming `client_id`: it is torn down after the client's last SSE stream
+  detaches (plus a detach grace and a ~30s creation grace period; defaults
+  ~10s/~30s, tunable via env). The server idle-shuts-down (~60s) when no
+  workspaces remain. Clients announce exit with `DELETE /v1/clients/{id}`.
+- **C2 — No authentication.** The API is single-user and local, with no auth,
+  TLS, or origin checks on any endpoint (verified v0.91.2,
+  [THREAT_MODEL.md](THREAT_MODEL.md) Appendix). TCP exposure requires
+  external access control (bind to loopback, or front with a proxy).
 - **C3 — No fleet awareness.** A Crush server knows nothing about other servers.
   Cross-instance coordination is entirely the orchestrator's job.
 - **C4 — Version pinning.** Clients check server version/BuildID. The
@@ -50,6 +54,18 @@ Crush ships a first-class client/server mode:
 - **C5 — Evolving API.** The REST surface is documented via the swagger spec
   in-repo, not a stable contract. Pin against a known Crush version per
   deployment.
+- **C6 — Dangerous endpoints.** The API surface includes endpoints Matchmaker
+  must never call: an unauthenticated remote shell
+  (`POST .../agent/sessions/{sid}/shell`, no permission gate), runtime yolo
+  (`POST .../permissions/skip`), and config mutation (`config/set`,
+  `config/provider-key`). See §6 and THREAT_MODEL Appendix A1.
+- **C7 — Executable config.** `crushrc`/`.crushrc` are shell scripts executed
+  at config load, and config values undergo shell expansion (`$(cmd)`).
+  Creating a workspace on a project executes its config (THREAT_MODEL A2).
+- **C8 — In-memory permissions.** Permission grants (including
+  `allow_session`) live only in the server process; a restart resets them.
+  The only persistent grant is `allowed_tools` in config. There is no
+  sandbox behind a grant: gated tools run with full user privileges.
 
 ## 3. Topology
 
@@ -187,13 +203,20 @@ per-failure reactive handling. Each tick:
    instance demands).
 3. **Converge**:
    - Start missing servers: spawn `crush server -H tcp://127.0.0.1:{port}
-     --cwd {path}` as a supervised child; await health.
+     --cwd {path}` as a supervised child; await health. The `crush` binary is
+     resolved once at startup (absolute path or configured), never per spawn.
    - Create or adopt workspaces; **hold each workspace's SSE stream open** (C1),
-     reconnecting with backoff.
+     reconnecting with backoff. On adoption, verify `/v1/version` (version +
+     build_id) and that the workspace path matches the fleet entry; workspace
+     creation is first-create-wins on `yolo`/`data_dir`/`env`, so a foreign
+     prior creator must trigger recreation, not adoption (THREAT_MODEL §5.1).
    - Restart drifted instances (config change or version drift, C4) when idle;
-     queue the restart if busy.
+     queue the restart if busy. Restarts reset in-memory permission grants
+     (C8); supervision re-applies policy from scratch (§5.3).
    - Stop surplus instances (`shutdown_if_idle`, escalating to signals).
    - Quarantine crash-looping instances (max restarts per window) into `failed`.
+   - On clean orchestrator shutdown, retire the client claim
+     (`DELETE /v1/clients/{id}`) so workspaces tear down promptly (C1).
 4. **Adopt on startup**: when the orchestrator itself restarts, the first tick
    discovers live servers and adopts their workspaces rather than respawning —
    combined with the durable store (§5.2), in-flight goals resume.
@@ -224,13 +247,22 @@ updated at every state transition. This is a hard requirement:
 **Supervision** — consume each instance's SSE stream:
 
 - `permission_request` → apply the step's policy. `deny` rejects, `grant_all`
-  calls `POST .../permissions/grant`, `ask` escalates to the operator (§8).
+  answers each event with `grant`, `ask` escalates to the operator (§8) and
+  fails closed to `deny` when the operator channel is unavailable.
+  `grant_all` is implemented **per event**, never via
+  `POST .../permissions/skip` or workspace `yolo: true` — those are
+  server-wide, first-create-wins, and unrevocable without recreating the
+  workspace (C6, C8). Note: project-configured PreToolUse hooks can
+  auto-approve tool calls without a `permission_request` event; `deny` does
+  not suppress them (THREAT_MODEL §5.6).
 - `run_complete` → mark run terminal, extract results, wake dependents.
 - Stream loss → reconnect; if the workspace was torn down (C1), recreate and
   re-attach; an in-flight run whose stream is lost is marked `unknown` and
   reconciled against session state.
 - Timeouts → `POST .../sessions/{sid}/cancel`, run becomes `timed_out`.
-- Retries → same instance only, with backoff, per step policy.
+- Retries → same instance only, with backoff, per step policy. After an
+  instance restart, expect renewed `permission_request` events on retry:
+  prior grants were in-memory only (C8).
 
 ### 5.4 Coordination: passing notes
 
@@ -246,7 +278,11 @@ in its own goal.
 - **Registration**: the reconcile loop ensures each managed project's
   `.crushrc` registers the notes MCP server, merging into existing config
   non-destructively (add the `mcp` entry; never remove or rewrite unrelated
-  settings). Projects that opt out lose live note tools but still receive
+  settings; back up before first merge; fail closed on unparseable config).
+  Because Crush shell-expands config values (C7), merged entries must be
+  literal values only — no `$()`, backticks, or shell metacharacters — and
+  no value derived from agent or note content may ever be written into a
+  Crush config. Projects that opt out lose live note tools but still receive
   injected notes at dispatch (§5.6).
 - **Delivery semantics**: notes are at-least-once and unordered across
   senders. Unread notes addressed to an instance are delivered (a) at the
@@ -265,11 +301,17 @@ in its own goal.
 ### 5.5 Aggregation
 
 - Collect every run's outcome: status, messages/history
-  (`GET .../sessions/{sid}/messages`), timing, error details.
+  (`GET .../sessions/{sid}/messages` — potentially secret-bearing, handled
+  like workspace responses, §6), timing, error details.
 - Produce a per-goal report: step DAG annotated with per-run results, notes
   exchanged, and what needs attention. Format is an implementation decision.
+  Agent-originated strings are sanitized (control characters stripped)
+  before TUI display; reports default to local files with operator
+  permissions (THREAT_MODEL §5.4).
 - Retain full history (goal → steps → runs → events → notes) for audit and
-  `--continue`-style follow-up goals.
+  `--continue`-style follow-up goals. Every `permission_request` decision
+  (policy, request summary, decision) is recorded (THREAT_MODEL §5.3).
+  Retention is unbounded by default; a prune/gc subcommand is provided.
 
 ### 5.6 Explicit non-responsibilities
 
@@ -288,28 +330,40 @@ in its own goal.
   conflicting edits across projects.
 - **No implicit repo mutation beyond Crush's own.** Crush server workspace
   creation materializes a `.crush/` data dir inside each managed project
-  (verified v0.91.0, §9.6). The orchestrator adds the notes MCP registration
+  (verified v0.91.2, §9.6). The orchestrator adds the notes MCP registration
   (§5.4); both should be documented for users, and neither may overwrite
   existing project config.
 
 ## 6. Security Model
 
+Scope, trust boundaries, and the full STRIDE analysis live in
+[THREAT_MODEL.md](THREAT_MODEL.md); this section is the summary.
+
 - All Crush servers bind to `127.0.0.1` only (C2). Static ports are validated
   for collisions at fleet config load (§9.1).
-- The orchestrator is the only client of the fleet. If the orchestrator itself
-  ever exposes a remote API, authentication is mandatory at that layer.
+- The orchestrator is the only client of the fleet and uses a minimal
+  endpoint allowlist: it never calls the shell, `permissions/skip`, or
+  config-mutation endpoints (C6). If the orchestrator itself ever exposes a
+  remote API, authentication is mandatory at that layer.
+- Fleet project paths are trusted code: workspace creation executes any
+  `crushrc` in the tree (C7). Onboarding a project is an explicit operator
+  trust decision; the onboarding flow warns when a `crushrc`/`.crushrc`
+  exists.
 - Supervision defaults to `deny` for permission requests in unattended
-  operation; `grant_all` is an explicit per-step opt-in (equivalent to `--yolo`,
-  scoped to a step).
+  operation; `grant_all` is an explicit per-step opt-in (equivalent to
+  `--yolo`, scoped to a step, implemented per event — §5.3).
 - Note content is agent-generated and therefore **attacker-adjacent**: prompts
   consuming notes must treat them as untrusted data, not instructions.
 - **Instance-to-instance trust is flat.** Any participant in a goal can send
   notes to any other; there is no per-sender ACL. The fleet is a single trust
   domain.
 - No secrets in the fleet config; provider keys remain in each server's own
-  config via `POST .../config/provider-key` or on-disk config. Note that Crush
-  API responses can embed the effective config **including provider API keys**
-  (§9.6): the orchestrator must not log or persist raw API payloads.
+  config via `POST .../config/provider-key` or on-disk config. Crush API
+  responses embed the effective config **including provider API keys**
+  (§9.6): the client layer scrubs responses against a field allowlist before
+  anything is logged or persisted, including SSE `permission_request`
+  payloads, which carry full tool parameters.
+- The store and fleet config are created with `0600`/`0700` permissions.
 
 ## 7. Failure Modes
 
@@ -349,8 +403,11 @@ in its own goal.
 2. **Store — embedded SQLite** ([modernc.org/sqlite](https://gitlab.com/cznic/sqlite)).
    Relational fit for the goal/step/run DAG and note addressing; transactions
    for state transitions; pure Go, so the single-static-binary principle holds.
-3. **Pinned Crush version — v0.91.0.** Development and CI pin against this
-   release; the version check in the reconcile loop warns on mismatch.
+3. **Pinned Crush version — v0.91.2.** Development and CI pin against this
+   release; the version check in the reconcile loop warns on mismatch. The
+   client-claim lifecycle (C1) and idle-guarded shutdown are present since
+   v0.90.0; v0.91.2 is the verified patch. Bumping the pin requires
+   re-running the attack-surface review in THREAT_MODEL Appendix A.
 4. **Note transport — one multiplexed MCP server.** Resolved by research:
    Crush registers MCP servers via project-level config (`.crushrc` /
    `.crush.json`, merged over global config) with `http`, `stdio`, and `sse`
@@ -367,15 +424,21 @@ in its own goal.
    research: Crush's Go client lives under `internal/` and is not importable.
    The orchestrator ships its own minimal typed client covering the endpoints
    in §2, generated or handwritten from `internal/swagger/swagger.yaml` at the
-   pinned version. Verified against v0.91.0 by probing a live server:
+   pinned version. Verified against v0.91.2 by probing a live server:
    - `POST /v1/workspaces` requires a `client_id` field that **must be a UUID**
      (the orchestrator generates one identity per process lifetime) and a
-     `path` field (not `cwd`).
+     `path` field (not `cwd`). Workspace lifetime is tied to the client claim
+     (C1); duplicates are first-create-wins on `yolo`/`data_dir`/`env`.
    - `GET /v1/version` returns `{version, commit, build_id, go_version,
      platform}` — `build_id` distinguishes same-version rebuilds.
    - The workspace response embeds the **full effective config, including
      provider API keys**. Treat workspace API responses as secret-bearing:
      never log them raw, never persist them in the store (§6).
+   - `POST /v1/control` with `shutdown` is idle-guarded (refused while
+     workspaces live); the orchestrator uses `shutdown_if_idle` regardless.
+   - The client is allowlist-scoped: it implements only the endpoints in §2
+     and §5, and must never grow wrappers for the shell, `permissions/skip`,
+     or config-mutation endpoints (C6).
 
 ## 10. Implementation Stack
 
