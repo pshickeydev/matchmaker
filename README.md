@@ -10,7 +10,7 @@ outcome into a per-goal report.
 
 ## Status
 
-Early design. The architecture is specified in [docs/SPEC.md](docs/SPEC.md)
+Early design. The architecture is specified in [docs/DESIGN.md](docs/DESIGN.md)
 ([diagram](docs/architecture.svg)); there is no implementation yet.
 The threat model (scope, trust boundaries, STRIDE analysis) is in
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
