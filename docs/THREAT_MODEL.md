@@ -151,6 +151,14 @@ Threats against components Matchmaker implements or configures:
 9. **Orchestrator recovery** — adopt-vs-respawn decisions on restart; resume
    of in-flight goals by reconciling persisted session IDs against Crush's
    project-local durable session state without duplicating ambiguous dispatches.
+10. **Planning runs** — goal authoring through the fleet (DESIGN §5.7): bounded
+   operator objective input, prompt material derived only from the fleet
+   snapshot, extraction of the agent-drafted goal from the session's final
+   message, full submission-path validation of the untrusted draft (DESIGN
+   §5.2), bounded revision rounds, and operator review as the default gate
+   before a draft becomes a submitted goal. Draft files written for review
+   follow exported-report handling (operator-only permissions, no automatic
+   raw-content preview, renderer-sanitized display).
 
 ### 4.2 Deferred to Crush
 
@@ -259,6 +267,7 @@ model adds a requirement.
 | Store corruption/lock | TB1 | Existing: crash loudly, integrity-check before reconcile resumes (DESIGN §7). |
 | Instance shutdown is attempted while Matchmaker's SSE claim keeps its workspace alive | TB2/TB3 | **Required**: enter `draining`, stop dispatch, await runs unless forced, close the target workspace SSE stream, release its hold with workspace-scoped DELETE, await removal, then request idle shutdown. Use process signals only after bounded teardown timeouts; never retire the process-wide client to stop one instance. |
 | Orchestrator restart misses Crush's workspace detach grace | TB2/TB3 | **Required**: reconcile immediately before starting the periodic timer and attach the new process claim to matching workspaces. If expiry already occurred, recreate the workspace and reconcile runs from persisted session IDs without ambiguous resubmission. |
+| Planner draft (agent-generated goal DAG and step templates) is treated as trusted input | TB1/TB4 | **Required**: drafts are attacker-adjacent. Extract and parse the draft from the session's final message, then pass it through the same submission-path validation (DESIGN §5.2) against a current fleet snapshot; render its templates against validation data with the minimal function surface. Persist nothing beyond the planning run's own audit record until validation passes, and never dispatch work from a planning run. |
 
 ### 5.3 Repudiation and operational auditability
 
@@ -298,6 +307,7 @@ or remote audit sink outside Matchmaker's trust domain.
 | Fleet changes or retry history make fan-out aggregation nondeterministic | TB1 | **Required**: freeze target expansion at acceptance; represent each target with ordered immutable attempts; only the highest-numbered terminal attempt determines target status and downstream result reference. `unknown` is nonterminal and blocks aggregation; explicit `abandoned` is terminal and counts as failure. Step rollup waits for all targets and retry exhaustion: all success is `succeeded`, all failure is `failed`, mixed outcomes are `partial`. Dependents require `succeeded` unless `accept_partial_needs` was explicitly set. |
 | Invalid or implicit state transition releases serialization or dispatches work prematurely | TB1/TB2 | **Required**: enforce persisted instance and run transition tables. `unknown`, `approval_required`, `version_mismatch`, `draining`, and `failed` are dispatch-blocking. Only explicit operator abandonment converts an unresolved run to terminal `abandoned`; transition and actor are audited. |
 | Matchmaker orchestration metadata grows without bound | TB1 | **Required**: provide a prune/gc subcommand governed by operator policy. Crush separately owns retention of session messages and tool history; Matchmaker does not duplicate them. Explicitly exported reports are separate operator-owned artifacts. |
+| Planning loop exhausts resources via oversized or endlessly revised drafts | TB1/TB4 | **Required**: bound objective bytes, per-draft bytes, revision rounds, and total planning budget per request; reject beyond bounds without partial persistence. |
 
 ### 5.6 Elevation of privilege
 
@@ -307,7 +317,7 @@ or remote audit sink outside Matchmaker's trust domain.
 | Delayed or replayed permission event is granted under another run's policy | TB2/TB5 | **Required**: identify each server lifetime with an instance generation and bind each SSE stream and run to it. Never infer policy from the workspace's current activity alone. Requests from an old generation or outside the exact active run fail closed to `deny`. |
 | Permission grants silently reset on server restart | TB2 | **Required (new)**: Crush grants are in-memory per process (v0.91.2). After Matchmaker restarts an instance for crash recovery or approved config change, previously granted `allow_session`-style approvals are gone; supervision must re-apply the step's policy from scratch and expect renewed `permission_request` events on retry. |
 | Prompt injection via notes or upstream content steers an agent into requesting dangerous permissions | TB4/TB5 | Existing: notes labelled untrusted (DESIGN §6). Deny-by-default means injected instructions cannot self-authorize. Residual risk is accepted and documented for operators choosing `grant_all`; there is no sandbox behind a grant (Appendix A1), and a project-configured PreToolUse hook can auto-approve calls without Matchmaker seeing them, so `deny` does not suppress hook pre-approvals. |
-| Template injection: goal author (operator) writes a template that exfiltrates — operator is trusted, but a *future* goal-decomposition agent (DESIGN §8) would make templates agent-influenced | TB1 | **Required** (forward-looking): keep the template function surface minimal (no file/exec helpers); when §8 decomposition lands, templates become untrusted input and this control becomes mandatory. |
+| Template injection: templates are agent-influenced via planning-run drafts (DESIGN §5.7) | TB1/TB4 | **Required** (now mandatory, no longer forward-looking): keep the template function surface minimal (no file/exec helpers); drafts and the step templates they contain are untrusted input, validated and rendered against validation data before persistence, never executed by Matchmaker, and never dispatched from a planning run. `grant_all` supervision in a draft is always surfaced at review and blocks auto-submit. |
 | Reserved `ask` policy is accepted without an operator channel | TB1/TB2 | **Required**: v1 goal validation accepts only `deny` and `grant_all` and rejects `ask` explicitly. Enable `ask` only after an authenticated, available operator channel provides strict permission-request-to-run correlation and fail-closed behavior. |
 | Fleet server options override loopback binding, project path, or permission/lifecycle invariants | TB2/TB3 | **Required**: expose typed options only (`debug` and `data_dir` in v1); reject free-form flags. Matchmaker owns host, port, yolo, config, lifecycle, and profiling settings, passes project path only in workspace creation, and verifies endpoint, canonical workspace path, and effective options before adoption. |
 | Crush version or `build_id` differs from the reviewed deployment pin | TB2/TB3 | **Required**: place the instance in `version_mismatch` and block adoption and dispatch. Do not restart-loop the unchanged binary. Require the operator to install/configure the approved binary or record an explicit audited compatibility override for the observed version and `build_id`; a pin change triggers Appendix review. |
@@ -320,9 +330,11 @@ or remote audit sink outside Matchmaker's trust domain.
    This assumption carries more weight after the Crush source review: any
    local process has an unauthenticated remote shell on every fleet server
    (Appendix A1).
-2. The operator is trusted and is the only goal submitter (until §8), and
-   fleet project directories are operator-trusted code (crushrc execution,
-   §4.3.2).
+2. The operator is trusted and is the only goal submitter: planning runs
+   (DESIGN §5.7) may draft a goal, but the operator reviews and submits it;
+   autonomous submission exists only behind an explicit per-request operator
+   opt-in. Fleet project directories are operator-trusted code (crushrc
+   execution, §4.3.2).
 3. Crush's permission system works as documented; Matchmaker supervises but
    does not sandbox — and Crush itself provides no sandbox, only gating.
    Per-project servers provide fault and lifecycle isolation, not security
@@ -340,7 +352,10 @@ Revise this model when any of the following land (all DESIGN §8):
 - Event-driven intake (cron, webhooks) — new untrusted goal-submitters cross TB1.
 - Orchestrator remote API — TB7 becomes live; authentication mandatory.
 - Remote fleets — TB2 leaves loopback; §4.3.1 assumption breaks.
-- Goal decomposition by an agent — templates become untrusted (§5.6).
+- Autonomous goal submission — planner drafts dispatched without operator
+  review would remove the review gate and make the §5.6 template controls
+  load-bearing by default. (Planning with operator review is in scope,
+  DESIGN §5.7.)
 - Multi-tenancy or per-sender note ACLs — the flat trust domain assumption (DESIGN §6) changes.
 - Crush version pin bump — re-run the Appendix review against the new source.
 

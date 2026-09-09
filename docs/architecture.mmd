@@ -37,8 +37,9 @@ flowchart TB
         SN --- WN
     end
 
-    USER -->|"goal: steps, needs,<br/>supervision, timeouts"| DISP
+    USER -->|"goal: steps, needs,<br/>supervision, timeouts<br/>or plan request (§5.7)"| DISP
     FUTURE -.-> DISP
+    SUP -.->|"plan draft → operator review<br/>(§5.7)"| USER
     CONFIG -->|"desired state + validation snapshot"| RECON
     DISP <-->|"validate atomically<br/>persist frozen expansion"| STORE
     SUP <-->|"state transitions"| STORE

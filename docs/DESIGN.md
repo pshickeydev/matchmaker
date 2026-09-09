@@ -82,9 +82,9 @@ lock.
 CLI and TUI invocations are short-lived clients over an operator-only local Unix
 socket in the state directory. The daemon creates the socket under a `0700`
 directory, removes stale socket files only while holding the exclusive lock, and
-uses peer OS identity plus socket permissions as the v1 trust boundary. Goal
-submission, status, approvals, abandonment, report access, and shutdown use this
-local RPC. Requests carry idempotency keys so a client retry cannot duplicate a
+uses peer OS identity plus socket permissions as the v1 trust boundary. Planning
+requests, goal submission, status, approvals, abandonment, report access, and
+shutdown use this local RPC. Requests carry idempotency keys so a client retry cannot duplicate a
 goal or operator action. A network HTTP API remains future work.
 
 **One Crush server per project.** Each managed project runs its own
@@ -104,7 +104,7 @@ flowchart LR
     end
 
     CONFIG["Fleet config (static)"] --> RECON
-    USER["Operator CLI / TUI"] -->|"local RPC"| RPC -->|"goal (step DAG)"| DISP
+    USER["Operator CLI / TUI"] -->|"local RPC"| RPC -->|"goal (step DAG) / plan request"| DISP
 
     RECON -->|"spawn / workspace / adopt"| S1
     DISP -->|"POST agent"| W1
@@ -200,7 +200,9 @@ adoption and is persisted with runs and SSE streams.
 ### 4.3 Goal
 
 The top-level unit: a user-supplied objective. A goal decomposes into one or more
-**steps** with dependencies — a DAG. Goals are submitted imperatively through
+**steps** with dependencies — a DAG. Goals are authored either directly by the
+operator or as drafts produced by a planning run (§5.7) that the operator then
+reviews and submits. Either way, goals are submitted imperatively through
 the daemon's local RPC by CLI/TUI clients; event-driven intake is future work
 (§8). Submission is validated atomically
 before any goal state is persisted or work is dispatched (§5.2).
@@ -600,8 +602,10 @@ operator instructions, or security-sensitive authorization.
   does not provision, configure, validate, or depend on that infrastructure.
 - **No shared sessions.** Instances never share Crush sessions; coordination
   happens only through notes.
-- **No semantic routing.** Steps target explicit names/tags/`all`. Having an
-  agent decompose a natural-language goal into the DAG is future work (§8).
+- **No semantic routing.** Steps target explicit names/tags/`all`. Planning
+  runs (§5.7) may draft a goal's DAG and targets, but the produced steps still
+  target explicit names/tags/`all`, and Matchmaker never infers targets at
+  dispatch time.
 - **Goals are singletons.** A goal's steps run to completion (or partial
   completion) as one pass; re-running means submitting a follow-up goal.
   Recurring execution belongs to event-driven intake (§8).
@@ -619,6 +623,73 @@ operator instructions, or security-sensitive authorization.
   registration (§5.4); both should be documented for users, and neither may overwrite
   existing project config. MCP registration is optional per project and cannot
   express per-step access.
+
+### 5.7 Planning runs (goal authoring)
+
+Matchmaker never authors goal DAGs itself and embeds no LLM: a natural-language
+objective becomes a DAG through a **planning run** — an ordinary Crush run on a
+fleet instance that drafts the goal for operator review. The rationale is
+recorded in §9.7.
+
+- **Request**: `matchmaker goal plan "<objective>" --on <project>` over the
+  local RPC (§3). The operator names the planner instance explicitly; there is
+  no default and no semantic instance selection (§5.6). The request carries
+  the objective and the operator's supervision choice for the planner run
+  (default `deny`). Objective size is bounded by configuration. The request is
+  validated atomically before the plan goal is persisted: the project must
+  exist in the fleet snapshot, the supervision choice must be recognized, and
+  the objective must be within bounds.
+- **Planner goal**: the daemon persists the request as an internal goal of type
+  `plan`: a single step with one explicit target, a Matchmaker-owned prompt
+  template, a configured timeout, and a retry policy like any step — transient
+  failures produce new numbered attempts under §5.3. From there it is an
+  ordinary goal: dispatch, serialization, supervision, timeout, recovery, and
+  audit reuse §5.3 unchanged, including demand-start of a stopped instance
+  (§5.1). The revision loop below is separate from step retries: it triggers
+  only when an attempt completes but its draft is invalid.
+- **Planner prompt**: rendered from the objective plus a read-only fleet
+  snapshot (project names, tags) taken when the request is accepted. It
+  instructs the planner to return, in its final message, one fenced
+  `matchmaker-goal` block containing the complete goal in the submission
+  schema (§4.4): steps, prompts as `text/template`, explicit targets, `needs`,
+  `supervision`, `timeout`, `retries`. The prompt contains no secrets and no
+  fleet data beyond the snapshot.
+- **Extraction**: on the planner run's `run_complete`, read the session's
+  final assistant message through the workspace session API (the same path
+  recovery uses, §5.3) and extract the last `matchmaker-goal` block. A missing
+  or unparseable block is an invalid draft.
+- **Validation**: a draft is agent-generated and therefore attacker-adjacent —
+  exactly like notes (§6). It is pre-validated at extraction (all §5.2 checks,
+  same limits) purely for operator feedback; the authoritative validation
+  happens atomically at submission against a current fleet snapshot, since the
+  fleet may change between draft and submission. A planning run never persists
+  goal state beyond its own audit records and never dispatches work.
+- **Scope exclusions**: planning goals are excluded from coordination and
+  reporting: the coordination tools (§5.4) reject `plan` goals, planner prompts
+  carry no injected notes, and plan goals produce no per-goal report — their
+  outcome is the extracted draft plus the ordinary audit trail (§5.5).
+- **Operator review — the default path**: the CLI returns the draft for
+  review, rendering the step graph (targets, dependencies, supervision,
+  timeouts) and validation status through the terminal renderer (§5.5). The
+  draft is written to an operator-selected path as JSON with operator-only
+  permissions, following exported-report handling (§5.5): it is raw agent
+  content and may contain terminal escapes. The operator edits the file freely
+  and submits it through the normal goal-submission path; the submitted goal
+  records its originating planning run for provenance. The operator, not the
+  agent, remains the goal submitter.
+- **Auto-submit**: an explicit `--auto-submit` submits a valid draft
+  immediately. It refuses drafts whose steps use `grant_all` supervision; those
+  always require review. Auto-submission is an operator choice per request,
+  not a property of the planner.
+- **Revision loop**: an invalid draft can be retried by dispatching a further
+  planning run whose prompt appends the prior draft and the validation errors.
+  Revisions are ordinary planning attempts under a configured maximum revision
+  count and total planning budget; once exhausted, the operator files a new
+  request.
+- **Limits**: configured bounds cover objective bytes per request, draft bytes
+  per extraction, and the revision budget. Bounds are checked before dispatch
+  and extraction; rejections return explicit errors without partial
+  persistence.
 
 ## 6. Security Model
 
@@ -649,6 +720,9 @@ Scope, trust boundaries, and the full STRIDE analysis live in
   yolo.
 - Note content is agent-generated and therefore **attacker-adjacent**: prompts
   consuming notes must treat them as untrusted data, not instructions.
+- Planning-run drafts are agent-generated and therefore **attacker-adjacent**
+  (§5.7): they enter the store only through §5.2 validation and, by default,
+  only after operator review. A planning run never dispatches work itself.
 - **Instance-to-instance trust is flat.** Any participant in a goal can send
   notes to any other; there is no per-sender ACL. Sender fields are unverified
   attribution, and per-goal checks prevent accidental misuse rather than
@@ -686,14 +760,18 @@ Scope, trust boundaries, and the full STRIDE analysis live in
 | Note limit or rate exceeded | pre-write/pre-response validation | reject without partial write or allocation using a stable limit error code |
 | Crash during note-injected dispatch | selected note cursor not committed with accepted submission | preserve at-least-once delivery; duplicate injection is permitted, loss is not |
 | Store (SQLite) locked/corrupt | write failure on transition | crash the orchestrator loudly; on restart, integrity-check before reconcile resumes |
+| Planning run fails or times out | planner run reaches a non-succeeded terminal state | report to the operator; no goal state or dispatch results from the planning run; further attempts are new planning runs under configured bounds |
+| Planner draft missing, unparseable, or invalid | final-message extraction + §5.2 validation of the draft | report all validation errors with step context; persist no goal and dispatch nothing; offer bounded revision planning runs with the errors appended |
+| Planning revision budget exhausted | configured revision-round and byte limits | stop revising; return the latest draft and its errors; more attempts require a new operator request |
 
 ## 8. Future Work
 
 - **Event-driven intake**: cron, webhooks, issue-label triggers that submit
   goals. The durable store and reconcile loop are designed to accommodate this.
-- **Goal decomposition / matchmaking**: an agent that turns a natural-language
-  goal into a step DAG and selects targets from tags, repo metadata, and
-  prior-run outcomes.
+- **Planner improvements**: planning runs (§5.7) draft goals from the fleet
+  snapshot in v1. Remaining work: target selection informed by repo metadata
+  and prior-run outcomes, a configurable default planner instance, and planner
+  evaluation against operator-authored baselines.
 - **Operator escalation channel** for `ask` supervision (interactive approval).
   The reserved policy becomes valid only when Matchmaker provides an
   authenticated, available approval channel with request/run correlation and
@@ -754,6 +832,14 @@ Scope, trust boundaries, and the full STRIDE analysis live in
    - The client is allowlist-scoped: it implements only the endpoints in §2
      and §5, and must never grow wrappers for the shell, `permissions/skip`,
      or config-mutation endpoints (C6).
+7. **Goal authoring — planning runs through the fleet, not an embedded LLM.**
+   Natural-language objectives become step DAGs by dispatching an ordinary
+   Crush run on an operator-chosen instance (§5.7), rather than embedding an
+   LLM library (e.g. `fantasy`) in the daemon. This keeps the no-LLM-dependency
+   principle (§10.2), leaves provider credentials inside Crush, reuses
+   dispatch, supervision, and recovery unchanged, and gives the planner real
+   repo context. The draft is untrusted input: it is validated through §5.2
+   and, by default, submitted only after operator review.
 
 ## 10. Implementation Stack
 
@@ -766,7 +852,7 @@ technically aligned with the thing it orchestrates.
 
 | Concern | Library | Notes |
 |---|---|---|
-| CLI / commands | [cobra](https://github.com/spf13/cobra) (as in Crush) | goal submission, fleet management, report viewing |
+| CLI / commands | [cobra](https://github.com/spf13/cobra) (as in Crush) | goal planning and submission, fleet management, report viewing |
 | TUI (dashboard) | [bubbletea](https://github.com/charmbracelet/bubbletea) + [bubbles](https://github.com/charmbracelet/bubbles) + [lipgloss](https://github.com/charmbracelet/lipgloss) | live view of goals, runs, and notes; future operator escalation UI (§8) |
 | Logging | [charmbracelet/log](https://github.com/charmbracelet/log) | structured logs with bounded, normalized, quoted agent fields; no raw payload logging |
 | Configuration | [viper](https://github.com/spf13/viper) or plain TOML (Crush uses its own config) | fleet config, per-goal policies |
