@@ -42,11 +42,14 @@ Crush ships a first-class client/server mode:
 
 - **C1 — Client-claim lifecycle.** A workspace's lifetime is tied to the
   claiming `client_id`: it is torn down after the client's last SSE stream
-  detaches (plus a detach grace and a ~30s creation grace period; defaults
-  ~10s/~30s, tunable via env). The server idle-shuts-down (~60s) when no
-  workspaces remain. Clients announce exit with `DELETE /v1/clients/{id}`.
+  detaches, plus a detach grace (default ~10s) and a ~30s creation grace
+  (both verified v0.94.1; the detach grace and the ~60s idle shutdown are
+  tunable via `CRUSH_SERVER_DETACH_GRACE` / `CRUSH_SERVER_IDLE_TIMEOUT`).
+  The server idle-shuts-down (~60s) when no workspaces remain. Clients
+  announce exit with `DELETE /v1/clients/{id}`; once retired, later
+  creates from that client are refused.
 - **C2 — No authentication.** The API is single-user and local, with no auth,
-  TLS, or origin checks on any endpoint (verified v0.91.2,
+  TLS, or origin checks on any endpoint (verified v0.94.1,
   [THREAT_MODEL.md](THREAT_MODEL.md) Appendix). TCP exposure requires
   external access control (bind to loopback, or front with a proxy).
 - **C3 — No fleet awareness.** A Crush server knows nothing about other servers.
@@ -54,8 +57,9 @@ Crush ships a first-class client/server mode:
 - **C4 — Version pinning.** Clients check server version/BuildID. Matchmaker
   fails closed on an unapproved mismatch; restarting the same binary is not a
   remediation.
-- **C5 — Evolving API.** The REST surface is documented via the swagger spec
-  in-repo, not a stable contract. Pin against a known Crush version per
+- **C5 — Evolving API.** The REST surface is documented via the in-Go
+  endpoint registry (`internal/server/endpoints.go`, served at `/v1/docs/`),
+  not a stable contract. Pin against a known Crush version per
   deployment.
 - **C6 — Dangerous endpoints.** The API surface includes endpoints Matchmaker
   must never call: an unauthenticated remote shell
@@ -618,8 +622,10 @@ operator instructions, or security-sensitive authorization.
 - **No code merging.** The orchestrator reports results; it does not reconcile
   conflicting edits across projects.
 - **No implicit repo mutation beyond Crush's own.** Crush server workspace
-  creation materializes a `.crush/` data dir inside each managed project
-  (verified v0.91.2, §9.6). The orchestrator adds the coordination MCP
+  creation materializes a `.crush/` data dir (0700, `*` gitignore) inside
+  each managed project, and may auto-configure and persist Docker MCP
+  config when Docker is available (verified v0.94.1, §9.6 — see THREAT_MODEL
+  A3). The orchestrator adds the coordination MCP
   registration (§5.4); both should be documented for users, and neither may overwrite
   existing project config. MCP registration is optional per project and cannot
   express per-step access.
@@ -791,14 +797,18 @@ Scope, trust boundaries, and the full STRIDE analysis live in
 2. **Store — embedded SQLite** ([modernc.org/sqlite](https://gitlab.com/cznic/sqlite)).
    Relational fit for the goal/step/run DAG and note addressing; transactions
    for state transitions; pure Go, so the single-static-binary principle holds.
-3. **Pinned Crush version — v0.91.2.** Development and CI pin the expected
+3. **Pinned Crush version — v0.94.1.** Development and CI pin the expected
    version and approved `build_id`. Reconciliation fails closed into
    `version_mismatch` when either differs and does not restart the unchanged
    binary. The operator must install/configure the approved binary or explicitly
    record a compatibility override for the observed version and `build_id`.
    Overrides are deployment-specific, audited, and do not change the project
    pin. Bumping the pin requires re-running the attack-surface review in
-   THREAT_MODEL Appendix A.
+   THREAT_MODEL Appendix A (the v0.91.2 → v0.94.1 bump was re-reviewed
+   2026-09-12). Note v0.94.1 `build_id` semantics: release builds set it to
+   the commit via ldflags, but unflagged builds derive it from the
+   executable's modification time, so it changes on every recompile — pin
+   release builds or record per-build overrides.
 4. **Coordination transport — one multiplexed MCP server.** Crush's preferred
    `crushrc` format registers MCP servers with `http`, `stdio`, and `sse`
    transports. Matchmaker does not depend on legacy JSON configuration. It runs
@@ -812,23 +822,48 @@ Scope, trust boundaries, and the full STRIDE analysis live in
    instructions to fetch full results in bounded chunks through `result_read`.
    Planned data flow and incidental coordination share a transport but use
    separate tools and records. Prompt templates use Go `text/template`.
-6. **Crush API client — hand-rolled from the swagger spec.** Resolved by
-   research: Crush's Go client lives under `internal/` and is not importable.
-   The orchestrator ships its own minimal typed client covering the endpoints
-   in §2, generated or handwritten from `internal/swagger/swagger.yaml` at the
-   pinned version. Verified against v0.91.2 by probing a live server:
+6. **Crush API client — hand-rolled from the in-Go endpoint registry.**
+   Resolved by research: Crush's Go client lives under `internal/` and is not
+   importable. The orchestrator ships its own minimal typed client covering
+   the endpoints in §2 and §5, handwritten from the pinned version's
+   endpoint registry — at v0.94.1 the swagger YAML was replaced by the
+   in-Go `apigen` registry (`internal/server/endpoints.go`). Verified
+   against v0.94.1 source:
    - `POST /v1/workspaces` requires a `client_id` field that **must be a UUID**
      (the orchestrator generates one identity per process lifetime) and a
-     `path` field (not `cwd`). Workspace lifetime is tied to the client claim
-     (C1); duplicates are first-create-wins on `yolo`/`data_dir`/`env`.
+     `path` field (not `cwd`). The request also accepts `yolo`, `debug`,
+     `data_dir`, `env`, and `channels`; Matchmaker always sets explicit
+     values. Workspace lifetime is tied to the client claim (C1);
+     duplicates deduplicate by canonical path, first-create-wins on
+     `yolo`/`data_dir`/`env`.
    - `GET /v1/version` returns `{version, commit, build_id, go_version,
-     platform}` — `build_id` distinguishes same-version rebuilds.
+     platform}` — `build_id` distinguishes same-version rebuilds (see §9.3
+     on unflagged-build instability).
    - The workspace response embeds the **full effective config, including
      provider API keys**. Treat workspace API responses as secret-bearing:
      never log them raw, never persist them in the store (§6).
-   - `POST /v1/control` with `shutdown` is idle-guarded (refused while
-     workspaces live). Matchmaker closes the workspace SSE stream and releases
-     its workspace hold before using `shutdown_if_idle`.
+   - `POST .../agent` takes `{session_id, run_id, prompt}` and is
+     fire-and-forget: it validates, returns 202 with an empty body, and
+     dispatches the run on a goroutine. The caller-supplied `run_id` is
+     echoed on the `run_complete` event and is the only safe correlator;
+     outcomes never arrive on the submit response. Dedicated sessions are
+     created with `POST .../sessions`.
+   - The workspace event stream is **data-only SSE**: every frame is
+     `data: {"type": ..., "payload": ...}` — there are no named `event:`
+     lines, so discrimination happens on the JSON envelope's type field
+     (`message`, `permission_request`, `question_batch_request`,
+     `run_complete`, `session`, plus ignorable LSP/MCP/file/config events).
+     `run_complete` carries `{session_id, run_id, message_id, text, error,
+     cancelled}`; success is empty error and `cancelled: false`.
+   - `POST .../permissions/grant` echoes the **full permission request back**
+     in the body alongside the action; Crush defines `allow`,
+     `allow_session`, and `deny` — Matchmaker sends only `allow`/`deny`.
+     `POST .../questions/cancel` cancels the workspace's pending question
+     batch and takes no body.
+   - `POST /v1/control` refuses both `shutdown` and `shutdown_if_idle` while
+     workspaces live (both spellings idle-guarded in v0.94.1). Matchmaker
+     closes the workspace SSE stream and releases its workspace hold before
+     using `shutdown_if_idle`.
    - The client is allowlist-scoped: it implements only the endpoints in §2
      and §5, and must never grow wrappers for the shell, `permissions/skip`,
      or config-mutation endpoints (C6).

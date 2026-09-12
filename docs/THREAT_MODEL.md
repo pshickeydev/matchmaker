@@ -1,7 +1,8 @@
 # Matchmaker Threat Model
 
 Status: Draft
-Date: 2026-08-28 (updated after source review of charmbracelet/crush at v0.91.2)
+Date: 2026-09-12 (re-reviewed after source review of charmbracelet/crush at
+v0.94.1; original review 2026-08-28 at v0.91.2)
 
 Method: [STRIDE](https://learn.microsoft.com/en-us/previous-versions/commerce-server/ee823878(v=cs.20)), selected from the method catalog of the
 [OWASP Threat Modelling Guide](https://owasp.org/www-project-threat-modelling-guide/).
@@ -13,7 +14,7 @@ component boundaries.
 This document defines what Matchmaker's threat model covers, what it delegates
 to Crush, and where the trust boundaries lie. It refines (and does not
 replace) the security model in [DESIGN.md §6](DESIGN.md). §4.2 and the Appendix
-are grounded in a source review of Crush v0.91.2 (the version pinned by DESIGN
+are grounded in a source review of Crush v0.94.1 (the version pinned by DESIGN
 §9.3); re-verify when the pin moves.
 
 ## 1. System description
@@ -24,7 +25,7 @@ goal DAGs. See [DESIGN.md](DESIGN.md) §2–5 for the full architecture. Securit
 relevant facts:
 
 - All Crush servers bind to `127.0.0.1` with **no authentication** (C2) —
-  confirmed at source level in v0.91.2: no auth middleware, tokens, TLS, or
+  confirmed at source level in v0.94.1: no auth middleware, tokens, TLS, or
   origin checks on any endpoint (`internal/server/server.go`).
 - Matchmaker spawns servers as child processes via `os/exec`.
 - Matchmaker persists all goals, steps, runs, and notes in a local SQLite
@@ -41,7 +42,7 @@ relevant facts:
 - The Crush API includes endpoints far more powerful than Matchmaker needs,
   including an **unauthenticated remote shell**
   (`POST /v1/workspaces/{id}/agent/sessions/{sid}/shell`, no permission gate,
-  v0.91.2 `internal/backend/agent.go`) and remote yolo
+  full user environment, v0.94.1 `internal/backend/agent.go`) and remote yolo
   (`POST .../permissions/skip`). See the Appendix.
 
 ## 2. Actors and assets
@@ -125,7 +126,7 @@ Threats against components Matchmaker implements or configures:
 4. **Supervision** — v1 permission policy enforcement (`deny`/`grant_all`),
    rejection of the reserved future `ask` policy, timeouts, cancellation, and
    SSE stream handling. Note: Crush permission grants
-   are **in-memory per server process** (v0.91.2 `internal/permission`); a
+   are **in-memory per server process** (v0.94.1 `internal/permission`); a
    server restart resets them, which Matchmaker's retry path must account for.
 5. **Coordination MCP server** — optional project-wide registration, monotonic
    note IDs, durable per-audience delivery cursors, frozen addressing, bounded
@@ -138,7 +139,8 @@ Threats against components Matchmaker implements or configures:
    **client-lifecycle discipline**. Matchmaker holds one stable `client_id` per
    process, releases individual workspace holds before idle shutdown, and uses
    `DELETE /v1/clients/{client_id}` only as final whole-process cleanup. Crush
-   v0.91.2 ties workspace lifetime to client claims; leaked or orphaned claims
+   v0.94.1 ties workspace lifetime to client claims (and refuses later creates
+   from a retired client); leaked or orphaned claims
    alter teardown and adoption behavior.
 7. **Secret hygiene** — ensuring raw Crush responses, provider keys, session
    messages, tool parameters, and tool history are never logged or inserted into
@@ -165,7 +167,7 @@ Threats against components Matchmaker implements or configures:
 Matchmaker relies on Crush for these and does not re-mitigate them. A failure
 here is a Crush vulnerability; Matchmaker's mitigations (deny-by-default
 supervision, quarantine) limit blast radius only. All items verified against
-the v0.91.2 source (see Appendix for endpoint-level detail).
+the v0.94.1 source (see Appendix for endpoint-level detail).
 
 1. **Agent sandboxing and tool gating** — the Crush permission system that
    decides what an agent may do inside its workspace (TB5). There is **no
@@ -176,7 +178,7 @@ the v0.91.2 source (see Appendix for endpoint-level detail).
    and prompt/data egress to providers (TB6). Keys are persisted by Crush at
    `~/.local/share/crush/crush.json` (mode 0600) or the workspace
    `.crush/crush.json`.
-3. **Crush server API correctness** — workspace lifecycle (C1; in v0.91.2
+3. **Crush server API correctness** — workspace lifecycle (C1; in v0.94.1
    tied to client claims with detach grace), session semantics, event stream
    correctness, and version compatibility (C4, C5).
 4. **MCP tool execution** — how Crush discovers, configures, and invokes MCP
@@ -251,7 +253,7 @@ model adds a requirement.
 |---|---|---|
 | Local process impersonates the orchestrator to a Crush server (grants permissions, submits prompts) | TB2 | *Accepted* (§4.3.1). Partial: loopback-only binding limits to local actors (existing). |
 | Local process or agent impersonates another agent to the coordination MCP server | TB4 | *Accepted*: `from` and `for` are required claimed project names so addressing is implementable, but are unauthenticated. Validate participation to prevent mistakes; preserve claims for coordination without presenting them as authenticated. |
-| Orchestrator adopts a foreign process listening on a fleet port as if it were a managed server | TB2/TB3 | **Required**: on adoption, verify `/v1/version` (version + `build_id`) against the approved compatibility policy and confirm the workspace path and effective typed options match the fleet entry before driving it. A mismatch blocks adoption. Note v0.91.2 deduplicates workspaces by canonicalized path and first-create-wins on `yolo`/`data_dir`/`env`; a foreign prior creator requires recreation. |
+| Orchestrator adopts a foreign process listening on a fleet port as if it were a managed server | TB2/TB3 | **Required**: on adoption, verify `/v1/version` (version + `build_id`) against the approved compatibility policy and confirm the workspace path and effective typed options match the fleet entry before driving it. A mismatch blocks adoption. Note v0.94.1 deduplicates workspaces by canonicalized path and first-create-wins on `yolo`/`data_dir`/`env`; a foreign prior creator requires recreation. |
 | Agent claims notes came from a trusted source | TB4 | Existing: notes are labelled "untrusted, from other agents" at injection (DESIGN §5.4). **Required**: preserve explicit claimed-sender/goal metadata in the injected section; never render notes as authenticated sender or operator instructions. |
 
 ### 5.2 Tampering
@@ -315,7 +317,7 @@ or remote audit sink outside Matchmaker's trust domain.
 |---|---|---|
 | `grant_all` automatically permits dangerous tool requests | TB2/TB5 | Existing: deny-by-default, `grant_all` is explicit per-step opt-in (DESIGN §6). **Required**: v1 gives every attempt a dedicated session because permission events lack `RunID`; correlate by workspace, dedicated session, and instance generation. Reject stale or mismatched requests, persist before responding, deduplicate request IDs, and send action `allow` only for the individual event. Never call `permissions/skip` or create a yolo workspace. |
 | Delayed or replayed permission event is granted under another run's policy | TB2/TB5 | **Required**: identify each server lifetime with an instance generation and bind each SSE stream and run to it. Never infer policy from the workspace's current activity alone. Requests from an old generation or outside the exact active run fail closed to `deny`. |
-| Permission grants silently reset on server restart | TB2 | **Required (new)**: Crush grants are in-memory per process (v0.91.2). After Matchmaker restarts an instance for crash recovery or approved config change, previously granted `allow_session`-style approvals are gone; supervision must re-apply the step's policy from scratch and expect renewed `permission_request` events on retry. |
+| Permission grants silently reset on server restart | TB2 | **Required (new)**: Crush grants are in-memory per process (v0.94.1). After Matchmaker restarts an instance for crash recovery or approved config change, previously granted `allow_session`-style approvals are gone; supervision must re-apply the step's policy from scratch and expect renewed `permission_request` events on retry. |
 | Prompt injection via notes or upstream content steers an agent into requesting dangerous permissions | TB4/TB5 | Existing: notes labelled untrusted (DESIGN §6). Deny-by-default means injected instructions cannot self-authorize. Residual risk is accepted and documented for operators choosing `grant_all`; there is no sandbox behind a grant (Appendix A1), and a project-configured PreToolUse hook can auto-approve calls without Matchmaker seeing them, so `deny` does not suppress hook pre-approvals. |
 | Template injection: templates are agent-influenced via planning-run drafts (DESIGN §5.7) | TB1/TB4 | **Required** (now mandatory, no longer forward-looking): keep the template function surface minimal (no file/exec helpers); drafts and the step templates they contain are untrusted input, validated and rendered against validation data before persistence, never executed by Matchmaker, and never dispatched from a planning run. `grant_all` supervision in a draft is always surfaced at review and blocks auto-submit. |
 | Reserved `ask` policy is accepted without an operator channel | TB1/TB2 | **Required**: v1 goal validation accepts only `deny` and `grant_all` and rejects `ask` explicitly. Enable `ask` only after an authenticated, available operator channel provides strict permission-request-to-run correlation and fail-closed behavior. |
@@ -359,27 +361,36 @@ Revise this model when any of the following land (all DESIGN §8):
 - Multi-tenancy or per-sender note ACLs — the flat trust domain assumption (DESIGN §6) changes.
 - Crush version pin bump — re-run the Appendix review against the new source.
 
-## Appendix: Crush v0.91.2 attack-surface inventory
+## Appendix: Crush v0.94.1 attack-surface inventory
 
-Source review of `github.com/charmbracelet/crush` at v0.91.2 (local clone:
-`~/experiments/crush`), focused on what an orchestrator must know. Crush has
+Source review of `github.com/charmbracelet/crush` at v0.94.1 (local clone:
+`~/experiments/crush`, re-reviewed 2026-09-12 for the pin bump from v0.91.2),
+focused on what an orchestrator must know. Crush has
 no SECURITY.md or published threat model; its server is designed under a
 "same OS user = trusted" assumption. Every control (permissions, bash
 blocklist, yolo) gates the *agent*, never the *API client*.
 
 ### A1. Unauthenticated API endpoints (all of `/v1`, no auth/TLS/origin checks)
 
+The endpoint registry lives in `internal/server/endpoints.go` (in-Go
+`apigen`; the swagger YAML of v0.91.x is gone). The workspace event stream is
+data-only SSE: each frame is `data: {"type": ..., "payload": ...}` with no
+named `event:` lines, so every event is discriminable — and forgeable — by
+any local process that can reach the stream.
+
 | Endpoint | Capability | Matchmaker exposure |
 |---|---|---|
 | `POST /v1/workspaces/{id}/agent/sessions/{sid}/shell` | **Arbitrary shell command** in the workspace dir, full user env; no permission gate (`internal/backend/agent.go`) | Never called by Matchmaker; reachable by any local process (accepted, §4.3.1) |
-| `POST /v1/workspaces/{id}/permissions/skip` | Enables yolo (disables all permission gating) at runtime | Never called; `grant_all` is implemented per-event instead (§5.6) |
-| `POST /v1/control` (`shutdown`) | Server shutdown; in v0.91.2 both spellings are **idle-guarded** (refused while workspaces live) | After closing the target SSE stream and releasing its workspace hold, Matchmaker uses `shutdown_if_idle` per DESIGN §5.1 |
-| `POST /v1/workspaces` | Caller-controlled `path` (any accessible absolute path — no jail), `yolo`, `data_dir`, `env`; first-create-wins on duplicates | Matchmaker always sets explicit values; verifies on adoption (§5.1) |
+| `POST /v1/workspaces/{id}/agent` | Submits a prompt on any session with a caller-chosen `run_id`; fire-and-forget 202, outcomes only via SSE | Matchmaker's intended path; equally reachable by any local process (accepted, §4.3.1) |
+| `POST /v1/workspaces/{id}/permissions/skip` (plus a GET state probe) | Enables yolo (disables all permission gating) at runtime | Never called; `grant_all` is implemented per-event instead (§5.6) |
+| `POST /v1/control` (`shutdown`, `shutdown_if_idle`) | Server shutdown; in v0.94.1 both spellings are **idle-guarded** (refused while workspaces live) | After closing the target SSE stream and releasing its workspace hold, Matchmaker uses `shutdown_if_idle` per DESIGN §5.1 |
+| `POST /v1/workspaces` | Caller-controlled `path` (any accessible absolute path — no jail), `yolo`, `debug`, `data_dir`, `env`, `channels`; deduplicates by canonical path, first-create-wins on duplicates | Matchmaker always sets explicit values; verifies on adoption (§5.1) |
 | `GET /v1/config`, `GET /v1/workspaces`, `GET .../{id}/config` | Return effective config **including resolved provider API keys**, unredacted | Scrubbed at client layer (§5.4) |
-| `POST .../config/set`, `config/provider-key`, `config/model` | Mutate config; provider-key **persists keys to disk** (0600) | Matchmaker never mutates provider config |
-| `GET .../sessions/{sid}/messages` | Full conversation history | Read lazily for `result_read` and reports; potentially secret-bearing; never copied wholesale into Matchmaker's store |
+| `POST .../config/set`, `config/remove`, `config/provider-key`, `config/model`, `config/compact`, `config/import-copilot`, `config/refresh-oauth` | Mutate config; provider-key **persists keys to disk** (0600) | Matchmaker never mutates provider config |
+| `GET .../sessions/{sid}/messages` (and `.../messages/user`) | Full conversation history | Read lazily for `result_read` and reports; potentially secret-bearing; never copied wholesale into Matchmaker's store |
+| `POST .../questions/answer`, `POST .../questions/cancel` | Answer or cancel a pending question batch; cancel is workspace-scoped with no body | Matchmaker calls cancel immediately (fail closed, DESIGN §5.3) |
 | `DELETE /v1/workspaces/{id}?client_id=...` | Releases one client's creation hold; live SSE streams continue holding the workspace | Used after closing the target stream during per-instance drain |
-| `DELETE /v1/clients/{client_id}` (new in v0.91.x) | Retires a client claim across workspaces; workspace lifetime is tied to client claims with detach grace | Matchmaker keeps one stable `client_id` per process and retires it only as final whole-process shutdown cleanup |
+| `DELETE /v1/clients/{client_id}` | Retires a client claim across workspaces; workspace lifetime is tied to client claims with detach grace, and v0.94.1 **refuses later creates from a retired client** (entries are never pruned) | Matchmaker keeps one stable `client_id` per process and retires it only as final whole-process shutdown cleanup |
 
 ### A2. Config is executable
 
@@ -404,10 +415,16 @@ blocklist, yolo) gates the *agent*, never the *API client*.
 - Permission grants are **in-memory only** (per process; `allow_session` does
   not survive restart). `allowed_tools` in config is the only persistent grant.
 - MCP servers from config are **auto-started with no confirmation**; stdio
-  MCP = arbitrary child process. MCP tool calls are permission-gated except a
-  hardcoded Docker MCP whitelist.
+  MCP = arbitrary child process. MCP tool calls are permission-gated like
+  other tools; the v0.91.2 hardcoded Docker MCP whitelist was **not found**
+  in the v0.94.1 permission service. Docker MCP is, however, auto-detected,
+  started, and **persisted into config** at workspace init when Docker is
+  available (`internal/backend/config.go`): Crush itself can therefore
+  mutate config after Matchmaker's fingerprint approval, so a post-approval
+  config change is not automatically proof of tampering.
 - LSP servers auto-spawn from config on file events (generic interpreters
-  denylisted); also startable via the API.
+denylisted, `internal/lsp/manager.go`); also startable via the API.
 - `CRUSH_PROFILE` starts a pprof server on `localhost:6060`.
-- Per-workspace `.crush/` dir is created 0700 with a `*` `.gitignore`; global
-  keys live in `~/.local/share/crush/crush.json` (0600).
+- Per-workspace `.crush/` dir is created 0700 with a `*` `.gitignore`
+  (`internal/backend/util.go`); global keys live in
+  `~/.local/share/crush/crush.json` (written 0600 via atomic rename).
