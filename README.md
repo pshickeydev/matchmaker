@@ -13,11 +13,23 @@ instance.
 ## Status
 
 Early design. The architecture is specified in [docs/DESIGN.md](docs/DESIGN.md)
-([diagram](docs/architecture.svg)); there is no implementation yet.
-The threat model (scope, trust boundaries, STRIDE analysis) is in
-[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+([diagram](docs/architecture.svg)); the threat model (scope, trust
+boundaries, STRIDE analysis) is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
+The Go tree is a function-level scaffold only: packages, types, and
+signatures with design-referencing doc comments exist, but all bodies are
+unimplemented stubs.
 
 ## Development
+
+Build, test, and format:
+
+```sh
+go build ./...
+go vet ./...
+go test ./...
+gofmt -w .
+```
 
 Regenerate the architecture diagram:
 
