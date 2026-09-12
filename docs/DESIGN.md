@@ -890,7 +890,7 @@ technically aligned with the thing it orchestrates.
 | CLI / commands | [cobra](https://github.com/spf13/cobra) (as in Crush) | goal planning and submission, fleet management, report viewing |
 | TUI (dashboard) | [bubbletea](https://github.com/charmbracelet/bubbletea) + [bubbles](https://github.com/charmbracelet/bubbles) + [lipgloss](https://github.com/charmbracelet/lipgloss) | live view of goals, runs, and notes; future operator escalation UI (§8) |
 | Logging | [charmbracelet/log](https://github.com/charmbracelet/log) | structured logs with bounded, normalized, quoted agent fields; no raw payload logging |
-| Configuration | [viper](https://github.com/spf13/viper) or plain TOML (Crush uses its own config) | fleet config, per-goal policies |
+| Configuration | plain TOML decoded with [BurntSushi/toml](https://github.com/BurntSushi/toml) into the typed config structs (viper rejected: oversized for two small typed files; Crush uses its own config) | fleet config, per-goal policies |
 | HTTP client / SSE | stdlib `net/http` + a small SSE reader | hand-rolled typed client for Crush's `/v1` API (§9.6) |
 | Durable store | [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) | pure-Go embedded SQLite (§9.2) |
 | MCP server (coordination) | [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) or Crush's own MCP packages | hosts `note_send`, `note_read`, and `result_read` for instances (§5.4) |
