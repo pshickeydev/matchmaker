@@ -1,0 +1,38 @@
+# Fleet desired state: one crush server per project (DESIGN §4.1).
+# Path is expanded (~ supported) and canonicalized at load; names, ports,
+# canonical paths, and effective data_dir values must each be unique.
+
+[[projects]]
+name = "api"
+path = "~/src/api"
+port = 41001
+tags = ["lang:go", "team:platform"]
+
+[[projects]]
+name = "web"
+path = "~/src/web"
+port = 41002
+tags = ["lang:ts", "team:platform"]
+
+[[projects]]
+name = "docs"
+path = "~/src/docs"
+port = 41003
+tags = ["lang:md"]
+# Projects may opt out of coordination MCP registration (DESIGN §5.4, §5.6);
+# they still receive bounded injected notes.
+note_opt_out = true
+
+# Typed, allowlisted optional server settings; v1 supports debug, data_dir,
+# and inherit_data_dir (DESIGN §4.1, §6). data_dir defaults to <project>/.crush.
+#
+# [projects.crush_options]
+# debug = true
+# data_dir = "/var/lib/matchmaker/web"
+# inherit_data_dir = true
+# Use the user's own crush data dir ($XDG_DATA_HOME/crush, else
+# ~/.local/share/crush): providers authenticated with `crush login`
+# (hyper, copilot, openai) store OAuth credentials in the data dir, so
+# only inheriting projects can use them. Inheriting projects share that
+# directory by design and forfeit per-project data isolation.
+# inherit_data_dir and data_dir are mutually exclusive.

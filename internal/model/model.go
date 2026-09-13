@@ -101,11 +101,13 @@ type TargetSpec struct {
 // ResolvedTarget is one resolved (project, step) pair produced by target
 // expansion during validation; the expansion is frozen at acceptance.
 type ResolvedTarget struct {
-	StepID    string
-	Project   string
-	Instance  string // fleet project name
-	ServerURL string
-	Workspace string // Crush workspace ID, filled once the workspace exists
+	StepID      string
+	Project     string
+	Instance    string // fleet project name
+	ServerURL   string
+	Workspace   string   // Crush workspace ID, filled once the workspace exists
+	Tags        []string // participant tags frozen with the expansion (§5.4 audience addressing)
+	ExecutionID string   // target execution owning this target's attempts, assigned at acceptance
 }
 
 // TargetExecution is one durable fan-out execution of a step on one

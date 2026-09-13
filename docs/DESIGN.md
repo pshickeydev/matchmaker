@@ -30,9 +30,13 @@ Crush ships a first-class client/server mode:
   project paths through workspace creation.
 - **Agent runs**: `POST /v1/workspaces/{id}/agent` submits a prompt. Sessions
   support `cancel`, `summarize`, and queued prompts.
-- **Event stream**: `GET /v1/workspaces/{id}/events` is an SSE stream emitting
-  `message`, `permission_request`, `session`, `run_complete` (carrying a
-  `RunID`), LSP/MCP events, etc.
+- **Event stream**: `GET /v1/workspaces/{id}/events?client_id={id}` is an SSE
+  stream emitting `message`, `permission_request`, `session`, `run_complete`
+  (carrying a `RunID`), LSP/MCP events, etc. The `client_id` query parameter is
+  required; holding the stream open is the workspace's client claim (C1), so
+  an unclaimed workspace expires after the detach grace. Each frame is a
+  `{type, payload}` envelope whose payload is itself `{type, payload}` holding
+  the typed event data one level deeper (verified v0.94.1).
 - **Supervision**: `POST .../permissions/grant`, `POST .../questions/answer`,
   `POST .../sessions/{sid}/cancel`.
 - **Lifecycle**: `GET /v1/health` for readiness; `POST /v1/control` with
@@ -167,12 +171,19 @@ The set of projects under management, statically declared in a fleet config:
 | `path` | Absolute project path sent in `POST /v1/workspaces` |
 | `port` | Unique loopback TCP port for the server |
 | `tags` | Labels for step targeting (e.g. `lang:go`, `team:platform`) |
-| `crush_options` | Typed, allowlisted optional server settings; v1 supports `debug` and `data_dir` |
+| `crush_options` | Typed, allowlisted optional server settings; v1 supports `debug`, `data_dir`, and `inherit_data_dir` |
 
 Fleet loading canonicalizes project paths and data directories. Names, ports,
 canonical paths, and effective `data_dir` values must each be unique; collisions
-are rejected before daemon reconciliation starts. The fleet config is the
-**desired state** input to the reconciliation loop (§5.1).
+are rejected before daemon reconciliation starts. A project may instead declare
+`crush_options.inherit_data_dir = true` to use the user's own default data
+directory (`$XDG_DATA_HOME/crush`, else `~/.local/share/crush`): interactive
+`crush login` stores OAuth credentials (hyper, copilot, openai) in the data
+directory, so only inheriting projects see them. Inheriting projects share
+that one directory by design: they are exempt from the data-dir uniqueness
+check and forfeit the per-project data isolation of a dedicated `data_dir`.
+`inherit_data_dir` and an explicit `data_dir` are mutually exclusive. The
+fleet config is the **desired state** input to the reconciliation loop (§5.1).
 
 ### 4.2 Instance
 
@@ -219,7 +230,10 @@ One node in a goal's DAG:
   are referenced, not inlined — the template receives a short excerpt and run
   handle per upstream step, and the agent fetches full results via the
   coordination MCP tools (§9.5).
-- `target`: explicit project names, a tag expression, or `all` (fan-out).
+- `target`: explicit project names, a tag expression, or `all` (fan-out). A
+  v1 tag expression is a comma-separated tag list read as a conjunction: a
+  project matches when it carries every listed tag. Empty expressions are
+  invalid, and `all` is a `TargetSpec` fan-out flag, not a tag.
 - `needs`: upstream step IDs that must complete first.
 - `accept_partial_needs`: whether dependents may run when an upstream fan-out
   step is `partial` (default `false`).
@@ -294,12 +308,21 @@ handling. Each reconciliation:
      resolved absolute `crush server` binary directly as a supervised child and
      await health. Project `path` is supplied only to `POST /v1/workspaces`; it
      is not a server flag. The binary is resolved once at startup, never per
-     spawn. Free-form server arguments are rejected.
+     spawn. Free-form server arguments are rejected. The child never inherits
+     the full parent environment: it receives `HOME`, `PATH`, the lifecycle
+     tunables, and the operator-declared `pass_env` variables of
+     matchmaker.toml — global crushrc files legitimately reference credentials
+     like provider API keys, and only declared names are copied through. The
+     idle timeout is deliberately raised from Crush's ~60s default to 1h:
+     Matchmaker owns instance lifecycle through drain and `shutdown_if_idle`,
+     and a 60s idle exit between goal steps would orphan sessions and result
+     sources.
    - Before creating, adopting, recreating, or restarting a workspace, compute a
      deployment fingerprint over project and global Crush configuration that can
      affect the server or workspace: applicable `crushrc`/`.crushrc`, legacy JSON
      still loaded by the pinned version, Matchmaker's selected environment
-     allowlist, resolved binary identity, and effective data directory. Store
+     allowlist (base keys, tunables, and the declared `pass_env` names), resolved
+     binary identity, and effective data directory. Store
      paths and content digests as the operator-approved fingerprint; additions,
      removals, and changes affect it. Matchmaker never creates, modifies, or
      relies on JSON configuration.
@@ -357,7 +380,13 @@ one immutable snapshot of the fleet config. Validation checks:
 - Every explicit project exists, every tag expression is syntactically valid,
   and every target resolves to at least one instance in the fleet snapshot.
 - Every prompt parses as Go `text/template` using only the documented minimal
-  function surface. Rendering against validation data must succeed.
+  function surface: the `text/template` builtins `and`, `or`, `not`, `len`,
+  `index`, `slice`, `printf`, `print`, `println`, `html`, `js`, `urlquery`,
+  `call`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`. Matchmaker supplies no custom
+  functions, so a template referencing anything else fails at parse time.
+  Upstream excerpts, run handles, and injected notes enter as data fields,
+  never as functions — no file/exec helpers (THREAT_MODEL template-injection
+  row). Rendering against validation data must succeed.
 - `timeout` and `retries` are present or defaultable and fall within configured
   ranges; supervision is recognized. Any session reuse or pinned-session field
   is rejected in v1.
@@ -492,7 +521,12 @@ operator instructions, or security-sensitive authorization.
 - **Registration**: Matchmaker depends only on Crush's preferred `crushrc`
   format, never legacy JSON configuration. It generates a deterministic shell
   fragment containing one literal `mcp add matchmaker --type http --url ...`
-  command. The onboarding command shows the exact fragment and requires explicit
+  command plus one `permissions allow mcp_matchmaker_note_send
+  mcp_matchmaker_note_read mcp_matchmaker_result_read` line: Crush exposes MCP
+  tools as `mcp_<server>_<tool>` and permission prompts are skipped for allowed
+  tools (verified v0.94.1), so the registered coordination tools stay usable
+  under `deny` supervision while every other tool remains denied. The
+  onboarding command shows the exact fragment and requires explicit
   operator approval before creating a new project `.crushrc` or appending a
   clearly delimited Matchmaker-owned block to an existing one. It backs up the
   file, acquires an exclusive file lock, refuses symlinks or concurrent changes,

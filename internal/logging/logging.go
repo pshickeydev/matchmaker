@@ -11,18 +11,31 @@ package logging
 
 import (
 	"io"
+	"time"
 
 	"github.com/charmbracelet/log"
+
+	"github.com/pshickeydev/matchmaker/internal/render"
 )
 
-const notImplemented = "not implemented"
+// timeFormat is the log timestamp layout.
+const timeFormat = time.DateTime
 
 // Setup installs the process-wide logger writing to w at the given level
 // and returns it.
-func Setup(w io.Writer, level log.Level) *log.Logger { panic(notImplemented) }
+func Setup(w io.Writer, level log.Level) *log.Logger {
+	logger := log.New(w)
+	logger.SetLevel(level)
+	logger.SetReportTimestamp(true)
+	logger.SetTimeFormat(timeFormat)
+	log.SetDefault(logger)
+	return logger
+}
 
 // AgentField prepares one structured log field value from
 // agent-controlled text: the value is control/escape-normalized,
 // length-bounded, and quoted (DESIGN §5.5). It is passed to
 // logger.With(key, value), never used as a message string.
-func AgentField(agentText string, maxLen int) string { panic(notImplemented) }
+func AgentField(agentText string, maxLen int) string {
+	return render.NormalizeField(agentText, maxLen)
+}

@@ -104,7 +104,13 @@ func ExpandAudience(a Audience, participants map[string][]string) []string {
 		}
 		return all
 	case a.Tag != "":
-		return append([]string(nil), participants[a.Tag]...)
+		var matched []string
+		for project, tags := range participants {
+			if slices.Contains(tags, a.Tag) {
+				matched = append(matched, project)
+			}
+		}
+		return matched
 	default:
 		return []string{a.Project}
 	}

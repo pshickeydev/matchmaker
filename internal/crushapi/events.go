@@ -3,6 +3,7 @@ package crushapi
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 
 	"github.com/pshickeydev/matchmaker/internal/sse"
 )
@@ -75,30 +76,151 @@ type Event struct {
 	Complete *RunComplete
 }
 
+// envelope is the wire shape of one SSE data frame.
+type envelope struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// unwrapPayload opens the nested {type, payload} event envelope one
+// level so typed decodes see the actual event data; a payload without
+// the nested shape is returned unchanged.
+func unwrapPayload(payload json.RawMessage) json.RawMessage {
+	var inner envelope
+	if err := json.Unmarshal(payload, &inner); err != nil || len(inner.Payload) == 0 {
+		return payload
+	}
+	return inner.Payload
+}
+
+// sessionPayload extracts the session identifier shared by several event
+// types. Session events carry it as `id` (verified v0.94.1); message
+// events carry `session_id`.
+type sessionPayload struct {
+	SessionID string `json:"session_id"`
+	ID        string `json:"id"`
+}
+
+// questionPayload extracts the batch ID of a question event.
+type questionPayload struct {
+	ID         string `json:"id"`
+	SessionID  string `json:"session_id"`
+	ToolCallID string `json:"tool_call_id"`
+}
+
 // EventStream is an open workspace SSE connection. Holding it open is
 // what keeps the workspace alive (C1); Close detaches. Frames are decoded
 // by the sse reader (DESIGN §10.1), the wire-level driver below this
 // client layer; payloads are discriminated on the JSON envelope type.
 type EventStream struct {
 	reader *sse.Reader
+	events chan Event
+	errors chan error
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// newEventStream wires one open SSE response into a decoded event stream.
+func newEventStream(ctx context.Context, cancel context.CancelFunc, resp *http.Response) *EventStream {
+	stream := &EventStream{
+		events: make(chan Event),
+		errors: make(chan error, 1),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	raw := make(chan []byte)
+	stream.reader = sse.NewReader(ctx, resp, raw)
+	stream.reader.Start()
+	go stream.pump(raw)
+	return stream
+}
+
+// pump decodes raw SSE payloads into typed events until stream loss.
+func (s *EventStream) pump(raw chan []byte) {
+	defer close(s.events)
+	for payload := range raw {
+		var env envelope
+		if err := json.Unmarshal(payload, &env); err != nil {
+			select {
+			case s.errors <- err:
+			default:
+			}
+			continue
+		}
+		event, err := decodeEvent(env.Type, env.Payload)
+		if err != nil {
+			select {
+			case s.errors <- err:
+			default:
+			}
+			continue
+		}
+		select {
+		case s.events <- event:
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 // Events returns the decoded event channel. The channel closes on stream
 // loss; callers reconnect with backoff (DESIGN §5.3).
-func (s *EventStream) Events() <-chan Event { panic(notImplemented) }
+func (s *EventStream) Events() <-chan Event { return s.events }
 
 // Errors returns stream-level failures separate from events.
-func (s *EventStream) Errors() <-chan error { panic(notImplemented) }
+func (s *EventStream) Errors() <-chan error { return s.errors }
 
 // Close detaches the SSE stream without releasing the workspace hold;
 // workspace release uses DeleteWorkspace (DESIGN §5.1).
-func (s *EventStream) Close() error { panic(notImplemented) }
-
-// decodeEvent discriminates one envelope payload into an Event. It is
-// exported for tests of the envelope mapping.
-func decodeEvent(kind string, payload json.RawMessage) (Event, error) {
-	panic(notImplemented)
+func (s *EventStream) Close() error {
+	s.cancel()
+	return nil
 }
 
 // streamContext carries the stream's cancellation.
-func (s *EventStream) streamContext() context.Context { panic(notImplemented) }
+func (s *EventStream) streamContext() context.Context { return s.ctx }
+
+// decodeEvent discriminates one envelope payload into an Event. The
+// v0.94.1 wire nests one more layer than the outer envelope: the payload
+// is itself {type, payload} holding the typed event data (verified
+// against a live v0.94.1 server), so the nested layer is unwrapped
+// before the typed decodes. It is exported for tests of the envelope
+// mapping.
+func decodeEvent(kind string, payload json.RawMessage) (Event, error) {
+	payload = unwrapPayload(payload)
+	event := Event{Kind: kind}
+	switch kind {
+	case KindMessage, KindSession:
+		var session sessionPayload
+		if err := json.Unmarshal(payload, &session); err != nil {
+			return event, err
+		}
+		event.SessionID = session.SessionID
+		if event.SessionID == "" {
+			event.SessionID = session.ID
+		}
+	case KindPermissionRequest:
+		var request PermissionRequest
+		if err := json.Unmarshal(payload, &request); err != nil {
+			return event, err
+		}
+		event.SessionID = request.SessionID
+		event.Permission = &request
+	case KindQuestionBatch:
+		var question questionPayload
+		if err := json.Unmarshal(payload, &question); err != nil {
+			return event, err
+		}
+		event.SessionID = question.SessionID
+		event.QuestionID = question.ID
+	case KindRunComplete:
+		var complete RunComplete
+		if err := json.Unmarshal(payload, &complete); err != nil {
+			return event, err
+		}
+		event.SessionID = complete.SessionID
+		event.RunID = complete.RunID
+		event.Complete = &complete
+	}
+	return event, nil
+}
