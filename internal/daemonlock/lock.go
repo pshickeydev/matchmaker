@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -25,6 +26,7 @@ const (
 // and socket path for diagnostics, but that record is never treated as
 // proof of ownership without the OS lock.
 type Lock struct {
+	mu         sync.Mutex
 	file       *os.File
 	socketPath string
 }
@@ -64,9 +66,16 @@ func Acquire(stateDir string) (*Lock, error) {
 	return lock, nil
 }
 
-// Release drops the lock on clean shutdown.
+// Release drops the lock on clean shutdown. It is idempotent and safe
+// for concurrent calls: the daemon's Shutdown and an embedding caller's
+// cleanup may both invoke it.
 func (l *Lock) Release() error {
-	if l == nil || l.file == nil {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
 		return nil
 	}
 	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)

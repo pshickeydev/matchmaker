@@ -378,7 +378,10 @@ func (d *Dispatcher) DispatchRun(ctx context.Context, run model.Run) error {
 	if err := d.st.WithinTx(ctx, func(tx *store.Tx) error {
 		return tx.SetRunIdentifiers(ctx, run.ID, session.ID, crushRunID, promptHashHex)
 	}); err != nil {
-		return &serializationHeld{project: run.Project}
+		if errors.Is(err, store.ErrSerializationHeld) {
+			return &serializationHeld{project: run.Project}
+		}
+		return fmt.Errorf("persist run identifiers: %w", err)
 	}
 	if err := d.client.SubmitPrompt(ctx, instance.ServerURL, instance.WorkspaceID, session.ID, crushRunID, prompt); err != nil {
 		// Submission was not accepted; server-side state is unproven,
@@ -524,33 +527,17 @@ func (d *Dispatcher) AcquireSerialization(ctx context.Context, project string) (
 // durable target execution and instance, with backoff, per step policy.
 // A retry is not created or dispatched until the prior attempt is
 // terminal; an unknown attempt requires explicit abandonment first.
-func (d *Dispatcher) ScheduleRetry(ctx context.Context, exec model.TargetExecution, cause error) error {
-	step, err := d.stepForExecution(ctx, exec)
-	if err != nil {
-		return err
-	}
-	latest, err := d.st.LatestTerminalAttempt(ctx, exec.ID)
-	if err != nil {
-		return nil // no terminal attempt: nothing to retry
-	}
-	if !d.retryEligible(step, latest) {
-		return nil
-	}
-	if cause != nil {
-		log.Warn("scheduling retry", "execution", exec.ID, "attempt", latest.Attempt+1, "cause", cause.Error())
-	}
-	return d.st.WithinTx(ctx, func(tx *store.Tx) error {
-		return tx.CreateRun(ctx, model.Run{
-			GoalID: exec.GoalID, StepID: exec.StepID,
-			TargetExecutionID: exec.ID, Project: exec.Project,
-			ServerURL: latest.ServerURL, Status: model.RunQueued,
-		})
-	})
-}
 
 // scheduleRetry is the drive-loop wrapper: it appends the next attempt
-// when the latest terminal one failed and budget remains.
+// when the latest terminal one failed and budget remains. A live
+// (nonterminal) attempt means a retry is already scheduled or in flight;
+// that is normal flow, not an error.
 func (d *Dispatcher) scheduleRetry(ctx context.Context, exec model.TargetExecution, step model.Step) error {
+	for _, attempt := range exec.Attempts {
+		if !model.RunIsTerminal(attempt.Status) {
+			return nil
+		}
+	}
 	latest, err := d.st.LatestTerminalAttempt(ctx, exec.ID)
 	if err != nil {
 		return nil

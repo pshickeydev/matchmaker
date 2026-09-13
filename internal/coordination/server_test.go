@@ -238,6 +238,19 @@ func TestNoteSendAudienceForms(t *testing.T) {
 	}
 }
 
+func TestParseAudienceTaglessProject(t *testing.T) {
+	// A participant project with no tags maps to a nil tag slice; it must
+	// still be addressable by name.
+	participants := map[string][]string{"api": nil, "web": {"lang:ts"}}
+	audience, err := parseAudience("api", participants)
+	if err != nil {
+		t.Fatalf("parseAudience(tagless project) = %v", err)
+	}
+	if audience.Project != "api" {
+		t.Fatalf("audience = %+v, want project api", audience)
+	}
+}
+
 func TestNoteReadPagesWithCursor(t *testing.T) {
 	f := newFixture(t)
 	for i := 0; i < 3; i++ {

@@ -80,34 +80,17 @@ type Reconciler struct {
 }
 
 // streamConsumer handles one attached stream until loss; the
-// supervision package supplies the real implementation (DESIGN §5.1
-// AttachStream). Until supervision lands, the reconciler drains streams
-// to hold the workspace claim (C1).
+// supervision package supplies the implementation (DESIGN §5.1
+// AttachStream).
 type streamConsumer interface {
 	Consume(ctx context.Context, stream *crushapi.EventStream, instance model.Instance) error
-}
-
-// drainConsumer reads and discards events while holding the stream open.
-type drainConsumer struct{}
-
-// Consume drains until stream loss.
-func (drainConsumer) Consume(ctx context.Context, stream *crushapi.EventStream, _ model.Instance) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case _, ok := <-stream.Events():
-			if !ok {
-				return nil
-			}
-		}
-	}
 }
 
 // New builds a reconciler from the desired-state fleet config, daemon
 // configuration, the durable store, and the Crush client.
 func New(fleet *config.Fleet, mm *config.Matchmaker, st *store.Store, client *crushapi.Client, procs *Supervisor) *Reconciler {
 	supervisor := supervise.New(st, client)
+	supervisor.SetCancelGrace(mm.Supervision.CancelGrace)
 	return &Reconciler{
 		fleet:       fleet,
 		mm:          mm,
@@ -680,7 +663,7 @@ func binaryIdentity(path string) string {
 
 // envAllowlistDigest pins the child environment allowlist.
 func envAllowlistDigest(mm *config.Matchmaker) string {
-	entries := append([]string{envDetachGrace, envIdleTimeout}, baseEnvKeys()...)
+	entries := append([]string{envDetachGrace, envIdleTimeout}, baseEnvNames...)
 	// Declared pass_env names join the digest: adding or removing a name
 	// requires renewed operator approval, while credential rotation (a
 	// value change) does not.
@@ -988,6 +971,14 @@ func (r *Reconciler) streamLoop(ctx context.Context, project config.Project) {
 		if err != nil || instance.WorkspaceID == "" {
 			continue
 		}
+		// A drain or failure deliberately released the claim; do not
+		// reattach and fight the teardown (DESIGN §5.1). Reconciliation
+		// starts a fresh loop via AttachStream when the instance lives
+		// again.
+		switch instance.State {
+		case model.InstanceDraining, model.InstanceStopped, model.InstanceFailed:
+			return
+		}
 		stream, err := r.client.StreamEvents(ctx, serverURL(project), instance.WorkspaceID)
 		if err != nil {
 			log.Warn("SSE attach failed; retrying with backoff",
@@ -1140,7 +1131,11 @@ func buildChildArgv(project config.Project, mm *config.Matchmaker) ([]string, []
 	if project.CrushOptions.DataDir != "" {
 		argv = append(argv, dataDirFlag, project.CrushOptions.DataDir)
 	}
-	env := append(baseEnvKeys(), envDetachGrace, envIdleTimeout)
+	base, err := baseEnvKeys()
+	if err != nil {
+		return nil, nil, err
+	}
+	env := append(base, envDetachGrace, envIdleTimeout)
 	env = append(env, passThroughEnv(mm)...)
 	return argv, env, nil
 }
@@ -1160,13 +1155,18 @@ func passThroughEnv(mm *config.Matchmaker) []string {
 	return passed
 }
 
-// baseEnvKeys lists the inherited-from-parent allowlist keys.
-func baseEnvKeys() []string {
-	home, homeErr := os.UserHomeDir()
-	if homeErr != nil {
-		home = "/root"
+// baseEnvNames lists the inherited-from-parent allowlist key names.
+var baseEnvNames = []string{"HOME", "PATH"}
+
+// baseEnvKeys lists the inherited-from-parent allowlist entries. A
+// missing home directory fails the spawn rather than silently starting
+// the server with a wrong HOME.
+func baseEnvKeys() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve HOME: %w", err)
 	}
-	return []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	return []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}, nil
 }
 
 // awaitHealth polls readiness until the deadline.

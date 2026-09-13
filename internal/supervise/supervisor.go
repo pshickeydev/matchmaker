@@ -23,19 +23,28 @@ const (
 
 // defaultCancelGrace bounds unconfirmed cancellation before the instance
 // is drained and restarted (DESIGN §5.3). It is a variable so tests can
-// shorten it; the daemon's configured grace applies through the same
-// value at wiring time.
+// shorten it; the daemon's configured grace overrides it at wiring time
+// through SetCancelGrace.
 var defaultCancelGrace = 60 * time.Second
 
 // Supervisor owns one goroutine per open instance stream.
 type Supervisor struct {
-	st     *store.Store
-	client *crushapi.Client
+	st          *store.Store
+	client      *crushapi.Client
+	cancelGrace time.Duration
 }
 
 // New builds the supervisor over the store and Crush client.
 func New(st *store.Store, client *crushapi.Client) *Supervisor {
-	return &Supervisor{st: st, client: client}
+	return &Supervisor{st: st, client: client, cancelGrace: defaultCancelGrace}
+}
+
+// SetCancelGrace applies the configured cancellation grace
+// (supervision.cancel_grace); wiring code calls it once at startup.
+func (s *Supervisor) SetCancelGrace(grace time.Duration) {
+	if grace > 0 {
+		s.cancelGrace = grace
+	}
 }
 
 // Consume pumps one instance's SSE stream until stream loss, applying the
@@ -378,7 +387,7 @@ func (s *Supervisor) checkCancelGrace(ctx context.Context, run model.Run) error 
 	if run.CancelRequestedAt == nil {
 		return nil
 	}
-	if time.Since(*run.CancelRequestedAt) < defaultCancelGrace {
+	if time.Since(*run.CancelRequestedAt) < s.cancelGrace {
 		return nil
 	}
 	instance, err := s.st.Instance(ctx, run.Project)

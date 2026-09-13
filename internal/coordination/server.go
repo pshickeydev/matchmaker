@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -42,6 +44,9 @@ const (
 	resultCursorBase = 0
 	// cursorKeySize is the HMAC key length behind opaque result cursors.
 	cursorKeySize = 32
+	// shutdownGrace bounds the graceful HTTP shutdown when Serve's
+	// context ends, so a hung connection cannot block daemon exit.
+	shutdownGrace = 5 * time.Second
 )
 
 // Server is the coordination MCP server. It binds loopback only and
@@ -57,6 +62,9 @@ type Server struct {
 	// cursors; a daemon restart invalidates previously issued cursors.
 	cursorKey []byte
 
+	// mu guards listener, written by Serve and read by Addr (used by
+	// onboarding on the RPC goroutine).
+	mu       sync.Mutex
 	listener net.Listener
 	http     *http.Server
 }
@@ -123,14 +131,16 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		listener.Close()
 		return fmt.Errorf("coordination bind %s is not loopback", addr)
 	}
+	s.mu.Lock()
 	s.listener = listener
+	s.mu.Unlock()
 	handler := server.NewStreamableHTTPServer(s.mcp, server.WithStateLess(true))
 	s.http = &http.Server{Handler: handler}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.http.Serve(listener) }()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithCancel(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		s.http.Shutdown(shutdownCtx)
 		return nil
@@ -152,6 +162,8 @@ func loopback(addr net.Addr) bool {
 // Addr returns the bound loopback address used in the generated crushrc
 // registration fragment (DESIGN §5.4); nil before Serve binds.
 func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.listener == nil {
 		return nil
 	}
@@ -398,7 +410,7 @@ func parseAudience(to string, participants map[string][]string) (model.Audience,
 	switch {
 	case to == audienceAll:
 		return model.Audience{All: true}, nil
-	case participants[to] != nil && projectNamed(participants, to):
+	case projectNamed(participants, to):
 		return model.Audience{Project: to}, nil
 	case tagCarried(participants, to):
 		return model.Audience{Tag: to}, nil

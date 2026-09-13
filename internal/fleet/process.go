@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -23,9 +24,12 @@ func NewSupervisor() *Supervisor {
 // Child is one supervised crush server process.
 type Child struct {
 	project string
+	parent  *Supervisor
 	cmd     *exec.Cmd
 	done    chan struct{}
-	exited  bool
+	// exited is written last by await; exitErr is safe to read once
+	// Exited reports true (the atomic store orders the writes).
+	exited  atomic.Bool
 	exitErr error
 }
 
@@ -46,7 +50,7 @@ func (s *Supervisor) Spawn(project string, argv, env []string) (*Child, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn %s: %w", project, err)
 	}
-	child := &Child{project: project, cmd: cmd, done: make(chan struct{})}
+	child := &Child{project: project, parent: s, cmd: cmd, done: make(chan struct{})}
 	go child.await()
 	s.mu.Lock()
 	s.children[project] = child
@@ -57,7 +61,7 @@ func (s *Supervisor) Spawn(project string, argv, env []string) (*Child, error) {
 // await records the process exit so the reconciliation loop observes it.
 func (c *Child) await() {
 	c.exitErr = c.cmd.Wait()
-	c.exited = true
+	c.exited.Store(true)
 	close(c.done)
 }
 
@@ -72,7 +76,7 @@ func (c *Child) Pid() int {
 // Exited reports whether the child has exited; exit status is surfaced to
 // the reconciliation loop (crash-loop quarantine input, §5.1).
 func (c *Child) Exited() bool {
-	return c.exited
+	return c.exited.Load()
 }
 
 // ExitErr returns the recorded wait error once exited.
@@ -92,6 +96,12 @@ func (c *Child) Signal(sig syscall.Signal) error {
 
 // Stop removes the child from supervision; it does not signal.
 func (c *Child) Stop() error {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+	// A respawn may already have replaced this child.
+	if current, ok := c.parent.children[c.project]; ok && current == c {
+		delete(c.parent.children, c.project)
+	}
 	return nil
 }
 

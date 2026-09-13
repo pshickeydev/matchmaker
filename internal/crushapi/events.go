@@ -177,9 +177,6 @@ func (s *EventStream) Close() error {
 	return nil
 }
 
-// streamContext carries the stream's cancellation.
-func (s *EventStream) streamContext() context.Context { return s.ctx }
-
 // decodeEvent discriminates one envelope payload into an Event. The
 // v0.94.1 wire nests one more layer than the outer envelope: the payload
 // is itself {type, payload} holding the typed event data (verified

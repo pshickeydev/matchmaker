@@ -797,6 +797,11 @@ func (tx *Tx) UpdateRunStatus(ctx context.Context, runID string, from, to model.
 	return tx.transitionRun(ctx, runID, string(from), to, "", nil)
 }
 
+// ErrSerializationHeld reports that another non-queued nonterminal
+// attempt already holds the instance's serialization slot (§5.3);
+// callers treat it as normal flow, not failure.
+var ErrSerializationHeld = errors.New("serialization slot for instance is already held")
+
 // SetRunIdentifiers persists the dedicated session ID, caller-supplied
 // RunID, rendered-prompt hash, and dispatching state before the prompt is
 // submitted (§5.3). The queued -> dispatching transition is the
@@ -814,7 +819,7 @@ func (tx *Tx) SetRunIdentifiers(ctx context.Context, runID string, sessionID, cr
 		return err
 	}
 	if holderCount > 0 {
-		return errors.New("serialization slot for instance is already held")
+		return ErrSerializationHeld
 	}
 	if err := model.RunTransitionAllowed(model.RunQueued, model.RunDispatching); err != nil {
 		return err

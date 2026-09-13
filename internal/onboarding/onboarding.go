@@ -207,10 +207,15 @@ func replaceOwnedBlock(content, block []byte) ([]byte, error) {
 }
 
 // atomicWrite backs up the current file and installs the new content via
-// a temp file and rename, preserving permissions.
+// a temp file and rename, preserving permissions. A backup that cannot
+// be read fails the install (fail closed; DESIGN §5.4).
 func atomicWrite(target string, content []byte, info os.FileInfo) error {
+	prior, err := os.ReadFile(target)
+	if err != nil {
+		return fmt.Errorf("backup read: %w", err)
+	}
 	backup := target + backupSuffix
-	if err := os.WriteFile(backup, mustRead(target), info.Mode().Perm()); err != nil {
+	if err := os.WriteFile(backup, prior, info.Mode().Perm()); err != nil {
 		return err
 	}
 	temp, err := os.CreateTemp(filepath.Dir(target), ".matchmaker-install-*")
@@ -254,16 +259,6 @@ func writeNew(target, fragment string) error {
 		return err
 	}
 	return os.Rename(temp.Name(), target)
-}
-
-// mustRead reads the file being backed up; a missing file backs up as
-// empty.
-func mustRead(target string) []byte {
-	content, err := os.ReadFile(target)
-	if err != nil {
-		return nil
-	}
-	return content
 }
 
 // VerifyParse checks that Crush can parse the resulting config file: the

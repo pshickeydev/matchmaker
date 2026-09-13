@@ -98,6 +98,7 @@ func New(stateDir string, fleetCfg *config.Fleet, mmCfg *config.Matchmaker) (*Da
 	d.reconciler = fleet.New(fleetCfg, mmCfg, st, client, procs)
 	d.dispatcher = dispatch.New(st, client, notes.NewSelector(st), mmCfg)
 	d.supervisor = supervise.New(st, client)
+	d.supervisor.SetCancelGrace(mmCfg.Supervision.CancelGrace)
 	d.notesSvc = notes.New(st, mmCfg.NoteLimits)
 	d.coordination = coordination.New(d.notesSvc, st, client, mmCfg.NoteLimits)
 	d.aggregator = aggregate.New(st, sessionSource{client: client})
